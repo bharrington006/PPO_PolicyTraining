@@ -11,32 +11,46 @@ MODEL_PATH = Path(__file__).resolve().parent.parent / "mujoco_playground/SO-ARM1
 TARGET_LOW = np.array([0.15, -0.15, 0.05])
 TARGET_HIGH = np.array([0.30, 0.15, 0.25])
 
+FRAME_SKIP = 20           # physics ticks per action: 20 x 2 ms = 40 ms (25 decisions/s)
+MAX_EPISODE_STEPS = 100   # 100 x 40 ms = 4 s per episode
+# The gripper can't move gripperframe, so it is left out of the action for reaching
+ARM_ACTUATORS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+
 class MyRobotEnv(gym.Env):
     def __init__(self):
         self.model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
         self.data = mujoco.MjData(self.model)
         self.target = np.zeros(3)
+        self.step_count = 0
+
+        self.arm_ids = [self.model.actuator(name).id for name in ARM_ACTUATORS]
+        self.ctrl_low, self.ctrl_high = self.model.actuator_ctrlrange[self.arm_ids].T
 
         # qpos + qvel + (target - end-effector) vector
         obs_dim = self.model.nq + self.model.nv + 3
-        self.action_space = gym.spaces.Box(low=-1, high=1, shape=(self.model.nu,), dtype=np.float32)
+        self.action_space = gym.spaces.Box(low=-1, high=1, shape=(len(ARM_ACTUATORS),), dtype=np.float32)
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         mujoco.mj_resetData(self.model, self.data)
+        self.step_count = 0
         self.target = self.np_random.uniform(TARGET_LOW, TARGET_HIGH)
         # mj_resetData zeroes site_xpos; recompute it so the first obs sees the real end-effector position
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs(), {}
 
     def step(self, action):
-        self.data.ctrl[:] = action
-        mujoco.mj_step(self.model, self.data)
+        # Map each action from [-1, 1] onto that actuator's ctrlrange (radians)
+        action = np.clip(action, -1, 1)
+        self.data.ctrl[self.arm_ids] = self.ctrl_low + (action + 1) / 2 * (self.ctrl_high - self.ctrl_low)
+        mujoco.mj_step(self.model, self.data, nstep=FRAME_SKIP)
+        self.step_count += 1
+
         obs = self._get_obs()
         reward = self._compute_reward()
         terminated = self._check_termination()
-        truncated = False
+        truncated = self.step_count >= MAX_EPISODE_STEPS
         return obs, reward, terminated, truncated, {}
 
     def _ee_pos(self):
